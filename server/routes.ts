@@ -932,21 +932,59 @@ Generate a structured JSON response matching this schema:
       // --- SECTION 2: NEGATIVE ACCOUNTS IDENTIFIED (DYNAMIC) ---
       doc.font('Helvetica-Bold').fontSize(16).text('SECTION 2: NEGATIVE ACCOUNTS IDENTIFIED');
       doc.font('Helvetica').fontSize(10);
-      
-      const tableTop = doc.y + 10;
-      doc.font('Helvetica-Bold');
-      doc.text('Account Name', 50, tableTop);
-      doc.text('Account Number', 250, tableTop);
-      doc.text('Issue', 400, tableTop);
-      
-      let y = tableTop + 20;
-      doc.font('Helvetica');
-      for (const account of plan.negativeAccounts) {
-        if (y > 700) { doc.addPage(); y = 50; }
-        doc.text(account.accountName, 50, y);
-        doc.text(account.accountNumberMasked, 250, y);
-        doc.text(account.issueType, 400, y);
-        y += 20;
+
+      const tableColumns = {
+        name: { x: 50, width: 175 },
+        number: { x: 250, width: 125 },
+        issue: { x: 400, width: 145 },
+      };
+      const tableBottom = doc.page.height - 85;
+      const drawAccountTableHeader = (startY: number) => {
+        doc.font('Helvetica-Bold').fontSize(10);
+        doc.text('Account Name', tableColumns.name.x, startY, { width: tableColumns.name.width });
+        doc.text('Account Number', tableColumns.number.x, startY, { width: tableColumns.number.width });
+        doc.text('Issue', tableColumns.issue.x, startY, { width: tableColumns.issue.width });
+        return startY + 18;
+      };
+
+      let tableStartY = doc.y + 10;
+      if (tableStartY > tableBottom - 30) {
+        doc.addPage();
+        tableStartY = 50;
+      }
+
+      let y = drawAccountTableHeader(tableStartY);
+      const negativeAccounts = Array.isArray(plan.negativeAccounts) ? plan.negativeAccounts : [];
+      doc.font('Helvetica').fontSize(10);
+
+      if (negativeAccounts.length === 0) {
+        doc.text('No negative accounts found.', 50, y, { width: 495 });
+        y = doc.y + 10;
+      }
+
+      for (const account of negativeAccounts) {
+        const row = {
+          name: String(account.accountName || 'N/A'),
+          number: String(account.accountNumberMasked || 'N/A'),
+          issue: String(account.issueType || 'N/A'),
+        };
+        doc.font('Helvetica').fontSize(10);
+        const rowHeight = Math.max(
+          doc.heightOfString(row.name, { width: tableColumns.name.width }),
+          doc.heightOfString(row.number, { width: tableColumns.number.width }),
+          doc.heightOfString(row.issue, { width: tableColumns.issue.width }),
+        ) + 10;
+
+        if (y + rowHeight > tableBottom) {
+          doc.addPage();
+          y = drawAccountTableHeader(50);
+          doc.font('Helvetica').fontSize(10);
+        }
+
+        doc.text(row.name, tableColumns.name.x, y, { width: tableColumns.name.width });
+        doc.text(row.number, tableColumns.number.x, y, { width: tableColumns.number.width });
+        doc.text(row.issue, tableColumns.issue.x, y, { width: tableColumns.issue.width });
+        y += rowHeight;
       }
       doc.y = y;
       doc.moveDown();

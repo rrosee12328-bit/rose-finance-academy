@@ -1,4 +1,4 @@
-import { pgTable, text, serial, timestamp, jsonb, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, serial, timestamp, jsonb, boolean, integer } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -22,6 +22,22 @@ export const insertCreditReportSchema = createInsertSchema(creditReports).omit({
 
 export type InsertCreditReport = z.infer<typeof insertCreditReportSchema>;
 export type CreditReport = typeof creditReports.$inferSelect;
+
+export const conversations = pgTable("conversations", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
+export const messages = pgTable("messages", {
+  id: serial("id").primaryKey(),
+  conversationId: integer("conversation_id")
+    .notNull()
+    .references(() => conversations.id),
+  role: text("role").notNull(),
+  content: text("content").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
 
 // --- API CONTRACT TYPES ---
 // What the frontend sends to process a PDF
