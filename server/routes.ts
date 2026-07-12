@@ -5,10 +5,8 @@ import { api } from "@shared/routes";
 import { z } from "zod";
 import multer from "multer";
 import { openai } from "./replit_integrations/audio/client";
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-const { PDFParse } = require("pdf-parse");
-const PDFDocument = require("pdfkit");
+import { PDFParse } from "pdf-parse";
+import PDFDocument from "pdfkit";
 
 // Setup multer for file uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -143,16 +141,26 @@ function maskAccountNumber(raw: string): string {
   return cleaned;
 }
 
+function hasUsableAccountNumber(accountNumber: string): boolean {
+  const normalized = maskAccountNumber(accountNumber);
+  return Boolean(
+    normalized &&
+    normalized !== 'N/A' &&
+    /[\d*#•]/.test(normalized) &&
+    normalized.replace(/\D/g, '').length >= 4
+  );
+}
+
 function extractAccountNumberFromText(rawBlock: string): string {
   const lines = rawBlock.split('\n').map(line => line.trim()).filter(Boolean);
-  const labeledAccountPattern = /(?:account\s*(?:number|#|num|no\.?)|acct\s*(?:#|num|no\.?|number)?|case\s*(?:number|#))\s*[:#\-–]?\s*([A-Z0-9*Xx#•\- ]{3,32})/i;
+  const labeledAccountPattern = /(?:account\s*(?:number|#|num|no\.?)|acct\s*(?:#|num|no\.?|number)?|case\s*(?:number|#))\s*[:#\-–]?\s*([#*Xx•-]*\d[#*Xx•\-\d ]{3,31})/i;
 
   for (const line of lines) {
     if (/account\s+name/i.test(line)) continue;
     const labeledMatch = line.match(labeledAccountPattern);
     if (labeledMatch) {
       const masked = maskAccountNumber(labeledMatch[1]);
-      if (masked.length >= 4) return masked;
+      if (hasUsableAccountNumber(masked)) return masked;
     }
   }
 
@@ -163,7 +171,8 @@ function extractAccountNumberFromText(rawBlock: string): string {
     const raw = match[0];
     if (/^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$/.test(raw)) continue;
     if (/^\d{3}[- ]?\d{3}[- ]?\d{4}$/.test(raw)) continue;
-    return maskAccountNumber(raw);
+    const masked = maskAccountNumber(raw);
+    if (hasUsableAccountNumber(masked)) return masked;
   }
 
   return '';
@@ -287,7 +296,7 @@ function extractCollectionBlocks(text: string): CollectionBlock[] {
 
     const normName = normalizeNameKey(companyName);
     const isDuplicate = blocks.some(b => {
-      if (accountNumber && b.accountNumber && b.accountNumber === accountNumber) return true;
+      if (hasUsableAccountNumber(accountNumber) && hasUsableAccountNumber(b.accountNumber) && b.accountNumber === accountNumber) return true;
       const existingNorm = normalizeNameKey(b.companyName);
       return existingNorm === normName && normName !== 'unknowncollection';
     });
@@ -434,7 +443,12 @@ function mergePreExtractedCollectionAccounts(accounts: any[], blocks: Collection
       const existingNameKey = normalizeNameKey(account.accountName || '');
       const existingNumber = maskAccountNumber(account.accountNumberMasked || '');
 
-      if (blockAccountNumber && existingNumber && existingNumber === blockAccountNumber) return true;
+      if (
+        hasUsableAccountNumber(blockAccountNumber) &&
+        hasUsableAccountNumber(existingNumber) &&
+        existingNumber === blockAccountNumber &&
+        (!existingNameKey || existingNameKey === blockNameKey)
+      ) return true;
       return existingNameKey === blockNameKey;
     });
 
@@ -468,7 +482,12 @@ function mergePreExtractedCollectionAccounts(accounts: any[], blocks: Collection
     const numberKey = maskAccountNumber(account.accountNumberMasked || '');
     const isDuplicate = deduped.some(existing => {
       const existingNumber = maskAccountNumber(existing.accountNumberMasked || '');
-      if (numberKey && numberKey !== 'N/A' && existingNumber === numberKey) return true;
+      if (
+        hasUsableAccountNumber(numberKey) &&
+        hasUsableAccountNumber(existingNumber) &&
+        existingNumber === numberKey &&
+        normalizeNameKey(existing.accountName || '') === nameKey
+      ) return true;
       return normalizeNameKey(existing.accountName || '') === nameKey && nameKey.length > 0;
     });
 
