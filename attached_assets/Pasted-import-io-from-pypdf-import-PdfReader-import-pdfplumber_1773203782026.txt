@@ -1,0 +1,84 @@
+import io
+from pypdf import PdfReader
+import pdfplumber
+
+def parse_pdf_file(uploaded_file):
+    debug = {
+        "filename": getattr(uploaded_file, "name", "unknown.pdf"),
+        "size": 0,
+        "header_ok": False,
+        "parser_used": [],
+        "errors": [],
+        "char_count": 0,
+    }
+
+    try:
+        pdf_bytes = uploaded_file.read()
+        debug["size"] = len(pdf_bytes)
+
+        if not pdf_bytes:
+            return {"ok": False, "error": "Empty file uploaded.", "debug": debug}
+
+        debug["header_ok"] = pdf_bytes[:4] == b"%PDF"
+
+        text_parts = []
+
+        # Try pypdf
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            pypdf_text = []
+            for page in reader.pages:
+                t = page.extract_text() or ""
+                if t.strip():
+                    pypdf_text.append(t)
+            if pypdf_text:
+                text_parts.append("\n".join(pypdf_text))
+                debug["parser_used"].append("pypdf")
+        except Exception as e:
+            debug["errors"].append(f"pypdf failed: {str(e)}")
+
+        # Try pdfplumber
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                plumber_text = []
+                for page in pdf.pages:
+                    t = page.extract_text() or ""
+                    if t.strip():
+                        plumber_text.append(t)
+            if plumber_text:
+                text_parts.append("\n".join(plumber_text))
+                debug["parser_used"].append("pdfplumber")
+        except Exception as e:
+            debug["errors"].append(f"pdfplumber failed: {str(e)}")
+
+        combined_text = "\n\n".join(text_parts).strip()
+        debug["char_count"] = len(combined_text)
+
+        if not debug["header_ok"]:
+            return {
+                "ok": False,
+                "error": "This upload does not appear to be a real PDF file.",
+                "debug": debug,
+            }
+
+        if debug["char_count"] < 300:
+            return {
+                "ok": False,
+                "error": "Valid PDF uploaded, but text extraction was limited. This file may require OCR or improved parser rules.",
+                "debug": debug,
+                "text": combined_text,
+            }
+
+        return {
+            "ok": True,
+            "text": combined_text,
+            "debug": debug,
+        }
+
+    except Exception as e:
+        debug["errors"].append(str(e))
+        return {
+            "ok": False,
+            "error": f"Unexpected PDF processing error: {str(e)}",
+            "debug": debug,
+        }

@@ -1,0 +1,114 @@
+@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Inter:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: 'Inter', sans-serif;
+  --font-display: 'Playfair Display', serif;
+
+  /* Rose Finance Academy - Dark Luxury Pink Theme */
+  --background: 222 47% 8%;
+  --foreground: 210 40% 98%;
+
+  --card: 222 47% 10%;
+  --card-foreground: 210 40% 98%;
+
+  --popover: 222 47% 8%;
+  --popover-foreground: 210 40% 98%;
+
+  /* Brand Pink Accent */
+  --primary: 330 86% 70%;
+  --primary-foreground: 222 47% 8%;
+
+  --secondary: 217 33% 15%;
+  --secondary-foreground: 210 40% 98%;
+
+  --muted: 217 33% 15%;
+  --muted-foreground: 215 20% 65%;
+
+  --accent: 330 86% 70%;
+  --accent-foreground: 222 47% 8%;
+
+  --destructive: 0 63% 31%;
+  --destructive-foreground: 210 40% 98%;
+
+  --border: 217 33% 17%;
+  --input: 217 33% 17%;
+  --ring: 330 86% 70%;
+
+  --radius: 0.75rem;
+
+  /* Brand palette tokens */
+  --brand-pink: #F472B6;
+  --brand-pink-hover: #EC4899;
+  --brand-pink-glow: rgba(244, 114, 182, 0.18);
+  --brand-pink-border: rgba(244, 114, 182, 0.35);
+  --brand-pink-light: #FBCFE8;
+  --brand-bg: #081225;
+  --brand-card: #0B1730;
+  --brand-card-alt: #101C3A;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    background-color: var(--brand-bg);
+  }
+  h1, h2, h3, h4, h5, h6 {
+    @apply font-display tracking-tight;
+  }
+}
+
+::selection {
+  background: var(--brand-pink-glow);
+  color: var(--brand-pink-light);
+}
+
+@layer utilities {
+  .glass-card {
+    background: var(--brand-card);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  }
+
+  .glass-card-alt {
+    background: var(--brand-card-alt);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
+  }
+  
+  .text-gradient {
+    @apply bg-clip-text text-transparent;
+    background-image: linear-gradient(135deg, var(--brand-pink), var(--brand-pink-light));
+  }
+
+  .brand-glow {
+    box-shadow: 0 4px 20px var(--brand-pink-glow), 0 0 40px var(--brand-pink-glow);
+  }
+
+  .brand-border {
+    border-color: var(--brand-pink-border);
+  }
+
+  .animate-in {
+    animation: animateIn 0.5s ease-out forwards;
+  }
+}
+
+@keyframes animateIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
