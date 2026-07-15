@@ -17,3 +17,5 @@ The GitHub connection here does NOT expose a raw access token (`listConnections`
 - Proxy rate limit is 10 RPS per repl — keep concurrency ≤5 with ~400ms pacing and retry on rate-limit errors
 - Script must run from the workspace root (module resolution), not /tmp
 - Upload the `git ls-files` list (respects .gitignore)
+
+**Caution:** snapshot pushes replace the entire tree on main — they silently override any commits made to GitHub by other tools. Before pushing, list recent commits on the repo; if there are GitHub-side commits not present locally, merge them into Replit first (fetch changed files at that ref via the Contents API, apply, `npm run db:push` if schema changed).
