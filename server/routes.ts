@@ -104,6 +104,13 @@ interface CollectionBlock {
   fallbackReason?: string;
 }
 
+interface NegativeAccountCandidate {
+  accountName: string;
+  accountNumberMasked: string;
+  issueType: string;
+  priority: "High" | "Medium" | "Low";
+}
+
 const BUREAU_HEADERS = /^(transunion|experian|equifax|tu|ex|eq)$/i;
 const GENERIC_LABELS = /^(collection account|account name|account number|acct(?:ount)?\s*(?:#|no\.?|number)?|status|type|date|balance|payment|remarks|comments|account type|responsibility|condition|pay status|account status|creditor|creditor name|company|company name|collector|collector name|collection agency|original creditor|credit limit|high balance|terms|date opened|date reported|date of status|last reported)$/i;
 const GENERIC_WORDS = /^(collection|account|status|type|date|the|and|for|with|from|this|that|not|are|was|were|has|have|had|been|will|would|could|should|may|might|shall|can|did|does|do|is|am|be)$/i;
@@ -151,20 +158,46 @@ function hasUsableAccountNumber(accountNumber: string): boolean {
   );
 }
 
+function chooseBestAccountNumber(raw: string): string {
+  const candidates: string[] = [];
+  const accountPattern = /(?:[#*Xx•-]+\s*)?\d{4,}/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = accountPattern.exec(raw)) !== null) {
+    const candidate = maskAccountNumber(match[0]);
+    if (hasUsableAccountNumber(candidate)) {
+      candidates.push(candidate);
+    }
+  }
+
+  if (candidates.length === 0) return '';
+
+  const counts = new Map<string, number>();
+  for (const candidate of candidates) {
+    counts.set(candidate, (counts.get(candidate) || 0) + 1);
+  }
+
+  return candidates.reduce((best, candidate) => {
+    const bestCount = counts.get(best) || 0;
+    const candidateCount = counts.get(candidate) || 0;
+    return candidateCount > bestCount ? candidate : best;
+  }, candidates[0]);
+}
+
 function extractAccountNumberFromText(rawBlock: string): string {
   const lines = rawBlock.split('\n').map(line => line.trim()).filter(Boolean);
-  const labeledAccountPattern = /(?:account\s*(?:number|#|num|no\.?)|acct\s*(?:#|num|no\.?|number)?|case\s*(?:number|#))\s*[:#\-–]?\s*([#*Xx•-]*\d[#*Xx•\-\d ]{3,31})/i;
+  const labeledAccountPattern = /(?:account\s*(?:number|#|num|no\.?)|acct\s*(?:#|num|no\.?|number)?|case\s*(?:number|#))\s*[:#\-–]?\s*(.+)$/i;
 
   for (const line of lines) {
     if (/account\s+name/i.test(line)) continue;
     const labeledMatch = line.match(labeledAccountPattern);
     if (labeledMatch) {
-      const masked = maskAccountNumber(labeledMatch[1]);
+      const masked = chooseBestAccountNumber(labeledMatch[1]);
       if (hasUsableAccountNumber(masked)) return masked;
     }
   }
 
-  const fallbackPattern = /\b(?:[#*xX•-]*\d[#*xX•\-\dA-Z]{3,}|\d{4,})\b/g;
+  const fallbackPattern = /\b(?:[#*xX•\-\s]*\d[#*xX•\-\dA-Z\s]{3,}|\d{4,})\b/g;
   let fallbackMatch: RegExpExecArray | null;
   while ((fallbackMatch = fallbackPattern.exec(rawBlock)) !== null) {
     const match = fallbackMatch;
@@ -176,6 +209,15 @@ function extractAccountNumberFromText(rawBlock: string): string {
   }
 
   return '';
+}
+
+function cleanSectionAccountName(rawName: string): string {
+  return rawName
+    .replace(/\s+\d+$/, '')
+    .replace(/\s*\(CLOSED\)\s*$/i, '')
+    .replace(/[,\s]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function scoreCompanyName(candidate: string): number {
@@ -319,6 +361,103 @@ function extractCollectionBlocks(text: string): CollectionBlock[] {
   return blocks;
 }
 
+function hasPositiveMoneyValue(values: string): boolean {
+  const moneyMatches = values.match(/\$[\d,]+/g) || [];
+  return moneyMatches.some(value => Number(value.replace(/[$,]/g, '')) > 0);
+}
+
+function inferNegativeIssueType(blockText: string): string | null {
+  const chargeOffLine = blockText
+    .split('\n')
+    .find(line => /^charge\s*off\s+amount\b/i.test(line));
+
+  if (chargeOffLine && hasPositiveMoneyValue(chargeOffLine)) {
+    return 'Charge-off';
+  }
+
+  const statusLine = blockText
+    .split('\n')
+    .find(line => /^(?:account\s+status|status)\b/i.test(line));
+
+  if (statusLine && /collection/i.test(statusLine)) {
+    return 'Collection';
+  }
+
+  if (/collection account/i.test(blockText) && /-\s*collection account/i.test(blockText)) {
+    return 'Collection';
+  }
+
+  if (/(?:30|60|90|120)\s+days\s+past\s+due/i.test(blockText) && !/\b0\s+0\s+0\b/.test(blockText)) {
+    return 'Late Payment';
+  }
+
+  if (/included in bankruptcy/i.test(blockText)) {
+    return 'Bankruptcy Public Record';
+  }
+
+  return null;
+}
+
+function extractNegativeTradelineAccounts(text: string): NegativeAccountCandidate[] {
+  const lines = text.split('\n').map(line => line.trim()).filter(Boolean);
+  const accounts: NegativeAccountCandidate[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const headerMatch = lines[i].match(/^([245]\.\d+)\s+(.+?)(?:\s+\d+)?$/);
+    if (!headerMatch) continue;
+
+    const accountName = cleanSectionAccountName(headerMatch[2]);
+    if (isJunkAccountName(accountName) || scoreCompanyName(accountName) < 0) continue;
+
+    const blockLines: string[] = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      if (/^[245]\.\d+\s+/.test(lines[j]) || /^(?:7|8|9|10|11|12)\.\s+/.test(lines[j])) break;
+      blockLines.push(lines[j]);
+    }
+
+    const rawBlock = blockLines.join('\n');
+    const accountNumberMasked = extractAccountNumberFromText(rawBlock);
+    if (!hasUsableAccountNumber(accountNumberMasked)) continue;
+
+    const issueType = inferNegativeIssueType(rawBlock);
+    if (!issueType) continue;
+
+    accounts.push({
+      accountName,
+      accountNumberMasked,
+      issueType,
+      priority: issueType === 'Late Payment' ? 'Medium' : 'High',
+    });
+  }
+
+  const deduped: NegativeAccountCandidate[] = [];
+  for (const account of accounts) {
+    const accountNameKey = normalizeNameKey(account.accountName);
+    const accountNumber = maskAccountNumber(account.accountNumberMasked);
+    const existing = deduped.find(candidate =>
+      normalizeNameKey(candidate.accountName) === accountNameKey &&
+      maskAccountNumber(candidate.accountNumberMasked) === accountNumber
+    );
+
+    if (!existing) {
+      deduped.push(account);
+      continue;
+    }
+
+    if (existing.issueType !== 'Charge-off' && account.issueType === 'Charge-off') {
+      existing.issueType = account.issueType;
+      existing.priority = account.priority;
+    }
+  }
+
+  console.log(`[Tradelines] Extracted ${deduped.length} negative tradeline accounts:`);
+  for (const account of deduped) {
+    console.log(`  - "${account.accountName}" | Acct: ${account.accountNumberMasked} | Issue: ${account.issueType}`);
+  }
+
+  return deduped;
+}
+
 // --- Post-AI Negative Account Validation ---
 const VALID_ISSUE_TYPES = /(collection|charge[\s-]?off|bankruptcy|public record|late|past due|delinquen|inquir|derogatory|repossession|foreclosure|judgment|tax lien|settled|default|no[\s-]?pay)/i;
 
@@ -327,6 +466,9 @@ const JUNK_PHRASES = [
   /classification/i,
   /account status/i,
   /payment status/i,
+  /^charge\s*off(?:\s+(?:0|n\/a|na|yes|no|unknown))*$/i,
+  /^public records?(?:\s+\d+|\s+0|\s+n\/a|\s+na)*$/i,
+  /^(?:equifax|experian|transunion)(?:\s+(?:equifax|experian|transunion))*$/i,
   /\bsummary\b/i,
   /\bbalances?\b.*\b(too high|utilization)\b/i,
   /creditor classification/i,
@@ -345,12 +487,35 @@ const JUNK_PHRASES = [
   /\bthe\b.*\b(table|section|chart|idea)\b/i,
 ];
 
+function isJunkAccountName(name: string): boolean {
+  const normalized = sanitizeCompanyCandidate(name);
+  if (!normalized) return true;
+  if (BUREAU_HEADERS.test(normalized)) return true;
+  if (GENERIC_LABELS.test(normalized)) return true;
+  if (isPlaceholderAccountName(normalized)) return true;
+
+  return JUNK_PHRASES.some(pattern => pattern.test(normalized));
+}
+
+function issueNeedsAccountNumber(issueType: string): boolean {
+  return /collection|charge[\s-]?off|late payment|past due|delinquen|derogatory|repossession|foreclosure|settled|default|no[\s-]?pay/i.test(issueType);
+}
+
 function computeAccountConfidence(account: any): number {
   let confidence = 0;
 
   const name = sanitizeCompanyCandidate(account.accountName || '');
   const acctNum = maskAccountNumber(account.accountNumberMasked || '');
   const issueType = (account.issueType || '').trim();
+  const hasAccountNumber = hasUsableAccountNumber(acctNum);
+
+  if (isJunkAccountName(name)) {
+    return 0;
+  }
+
+  if (issueNeedsAccountNumber(issueType) && !hasAccountNumber) {
+    return 0;
+  }
 
   if (name.length >= 2 && /[A-Za-z]/.test(name)) {
     if (!BUREAU_HEADERS.test(name) && !GENERIC_LABELS.test(name) && !isPlaceholderAccountName(name)) {
@@ -358,7 +523,7 @@ function computeAccountConfidence(account: any): number {
     }
   }
 
-  if (acctNum.length >= 2 && acctNum.toLowerCase() !== 'n/a' && /[\dxX*#•]/.test(acctNum)) {
+  if (hasAccountNumber) {
     confidence += 30;
   }
 
@@ -372,13 +537,6 @@ function computeAccountConfidence(account: any): number {
   const uniqueWords = new Set(nameWords.map(w => w.toLowerCase()));
   if (nameWords.length >= 3 && uniqueWords.size <= Math.ceil(nameWords.length / 2)) {
     confidence -= 40;
-  }
-
-  for (const pattern of JUNK_PHRASES) {
-    if (pattern.test(name)) {
-      confidence -= 50;
-      break;
-    }
   }
 
   if (/[.!?]$/.test(name) && nameWords.length > 4) {
@@ -426,18 +584,37 @@ function filterNegativeAccounts(accounts: any[]): any[] {
 function getTrustedCollectionBlocks(blocks: CollectionBlock[]): CollectionBlock[] {
   return blocks.filter(block => {
     const name = sanitizeCompanyCandidate(block.companyName);
-    return Boolean(name && !isPlaceholderAccountName(name) && scoreCompanyName(name) > 0);
+    return Boolean(
+      name &&
+      !isJunkAccountName(name) &&
+      hasUsableAccountNumber(block.accountNumber) &&
+      scoreCompanyName(name) > 0
+    );
   });
 }
 
-function mergePreExtractedCollectionAccounts(accounts: any[], blocks: CollectionBlock[]): any[] {
+function mergeTrustedNegativeAccounts(
+  accounts: any[],
+  blocks: CollectionBlock[],
+  tradelineAccounts: NegativeAccountCandidate[] = []
+): any[] {
   const merged = Array.isArray(accounts) ? accounts.map(normalizeNegativeAccount) : [];
   const trustedBlocks = getTrustedCollectionBlocks(blocks);
+  const trustedAccounts: NegativeAccountCandidate[] = [
+    ...tradelineAccounts,
+    ...trustedBlocks.map(block => ({
+      accountName: sanitizeCompanyCandidate(block.companyName),
+      accountNumberMasked: maskAccountNumber(block.accountNumber),
+      issueType: 'Collection',
+      priority: 'High' as const,
+    })),
+  ];
 
-  for (const block of trustedBlocks) {
-    const blockName = sanitizeCompanyCandidate(block.companyName);
+  for (const trustedAccount of trustedAccounts) {
+    const blockName = sanitizeCompanyCandidate(trustedAccount.accountName);
     const blockNameKey = normalizeNameKey(blockName);
-    const blockAccountNumber = maskAccountNumber(block.accountNumber);
+    const blockAccountNumber = maskAccountNumber(trustedAccount.accountNumberMasked);
+    if (!hasUsableAccountNumber(blockAccountNumber)) continue;
 
     const existing = merged.find(account => {
       const existingNameKey = normalizeNameKey(account.accountName || '');
@@ -456,14 +633,14 @@ function mergePreExtractedCollectionAccounts(accounts: any[], blocks: Collection
       if (isPlaceholderAccountName(existing.accountName || '') || !existing.accountName) {
         existing.accountName = blockName;
       }
-      if (blockAccountNumber && (!existing.accountNumberMasked || existing.accountNumberMasked === 'N/A')) {
+      if (hasUsableAccountNumber(blockAccountNumber) && (!existing.accountNumberMasked || existing.accountNumberMasked === 'N/A')) {
         existing.accountNumberMasked = blockAccountNumber;
       }
       if (!existing.issueType || !VALID_ISSUE_TYPES.test(existing.issueType)) {
-        existing.issueType = 'Collection';
+        existing.issueType = trustedAccount.issueType;
       }
       if (!existing.priority) {
-        existing.priority = 'High';
+        existing.priority = trustedAccount.priority;
       }
       continue;
     }
@@ -471,8 +648,8 @@ function mergePreExtractedCollectionAccounts(accounts: any[], blocks: Collection
     merged.push({
       accountName: blockName,
       accountNumberMasked: blockAccountNumber || 'N/A',
-      issueType: 'Collection',
-      priority: 'High',
+      issueType: trustedAccount.issueType,
+      priority: trustedAccount.priority,
     });
   }
 
@@ -509,6 +686,29 @@ function updateNegativeAccountCounts(plan: any): void {
     latePayments: negativeAccounts.filter((a: any) => /late payment|past due|delinquen/i.test(a.issueType)).length,
     publicRecords: negativeAccounts.filter((a: any) => /public record|bankruptcy|judgment|tax lien/i.test(a.issueType)).length,
     inquiries: negativeAccounts.filter((a: any) => /inquiry/i.test(a.issueType)).length,
+  };
+}
+
+function cleanGeneratedPlan(plan: any, extractedText?: string): any {
+  if (!plan || typeof plan !== 'object') return plan;
+
+  const tradelineAccounts = extractedText ? extractNegativeTradelineAccounts(extractedText) : [];
+  const cleanedPlan = {
+    ...plan,
+    negativeAccounts: filterNegativeAccounts(Array.isArray(plan.negativeAccounts) ? plan.negativeAccounts : []),
+  };
+
+  cleanedPlan.negativeAccounts = mergeTrustedNegativeAccounts(cleanedPlan.negativeAccounts, [], tradelineAccounts);
+  updateNegativeAccountCounts(cleanedPlan);
+  return cleanedPlan;
+}
+
+function cleanReportForResponse(report: any): any {
+  if (!report?.generatedPlan) return report;
+
+  return {
+    ...report,
+    generatedPlan: cleanGeneratedPlan(report.generatedPlan, report.extractedText),
   };
 }
 
@@ -679,7 +879,7 @@ export async function registerRoutes(
   
   app.get(api.reports.list.path, async (req, res) => {
     const reports = await storage.getReports();
-    res.json(reports);
+    res.json(reports.map(cleanReportForResponse));
   });
 
   app.get(api.reports.get.path, async (req, res) => {
@@ -687,7 +887,7 @@ export async function registerRoutes(
     if (!report) {
       return res.status(404).json({ message: "Report not found" });
     }
-    res.json(report);
+    res.json(cleanReportForResponse(report));
   });
 
   app.get(api.settings.get.path, async (req, res) => {
@@ -750,6 +950,7 @@ export async function registerRoutes(
       // 2. Pre-extract collection blocks with real company names
       const collectionBlocks = extractCollectionBlocks(extractedText);
       const trustedCollectionBlocks = getTrustedCollectionBlocks(collectionBlocks);
+      const negativeTradelineAccounts = extractNegativeTradelineAccounts(extractedText);
 
       // 3. Fetch current expert settings
       const settings = await storage.getSettings();
@@ -867,7 +1068,11 @@ Generate a structured JSON response matching this schema:
       const before = rawNegativeAccounts.length;
       generatedPlan.negativeAccounts = filterNegativeAccounts(rawNegativeAccounts);
       const filtered = generatedPlan.negativeAccounts.length;
-      generatedPlan.negativeAccounts = mergePreExtractedCollectionAccounts(generatedPlan.negativeAccounts, trustedCollectionBlocks);
+      generatedPlan.negativeAccounts = mergeTrustedNegativeAccounts(
+        generatedPlan.negativeAccounts,
+        trustedCollectionBlocks,
+        negativeTradelineAccounts
+      );
       const after = generatedPlan.negativeAccounts.length;
       console.log(`[Filter] Negative accounts: ${before} raw → ${filtered} validated → ${after} after extracted-account repair`);
 
@@ -897,7 +1102,7 @@ Generate a structured JSON response matching this schema:
         return res.status(404).json({ message: "Report not found" });
       }
 
-      const plan = report.generatedPlan as any;
+      const plan = cleanGeneratedPlan(report.generatedPlan as any, report.extractedText);
 
       // Generate PDF (bufferPages required for footer on all pages)
       const doc = new PDFDocument({ margin: 50, bufferPages: true });
