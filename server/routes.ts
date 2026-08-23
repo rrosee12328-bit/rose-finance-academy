@@ -43,7 +43,7 @@ function preprocessText(text: string): string {
 
 // Helper: Extract credit report data using pattern matching
 function extractCreditData(text: string): any {
-  const lowerText = text.toLowerCase();
+  const actualPublicRecordCount = extractActualPublicRecordCount(text);
 
   const patterns = {
     scores: /(?:fico|credit score|score)[\s:]*(\d{2,3})/gi,
@@ -51,8 +51,7 @@ function extractCreditData(text: string): any {
     chargeOffs: /charge[- ]?off|charged off|chargeoff/gi,
     latePayments: /late\s+(?:\d+|payment)|late \d+ days/gi,
     hardInquiries: /(?:hard\s+)?inquiry|inquiries/gi,
-    publicRecords: /bankruptcy|chapter\s*7|chapter\s*13|u\.?s\.?\s*bankruptcy\s*court|public\s*record|court\s*record|bk7|bk13|tax\s*lien|civil\s*judgment/gi,
-    derogatory: /derogatory|included in bankruptcy|account rating:\s*derogatory/gi,
+    derogatory: /derogatory|account rating:\s*derogatory/gi,
   };
 
   const found = {
@@ -78,21 +77,39 @@ function extractCreditData(text: string): any {
   found.chargeOffs = text.match(patterns.chargeOffs)?.length || 0;
   found.latePayments = text.match(patterns.latePayments)?.length || 0;
   found.inquiries = text.match(patterns.hardInquiries)?.length || 0;
-  found.publicRecords = text.match(patterns.publicRecords)?.length || 0;
+  found.publicRecords = actualPublicRecordCount;
   found.derogatory = text.match(patterns.derogatory)?.length || 0;
 
-  if (/chapter\s*7|bk7/i.test(text)) {
+  if (actualPublicRecordCount > 0 && /chapter\s*7|bk7/i.test(text)) {
     found.hasBankruptcy = true;
     found.bankruptcyChapter = "Chapter 7";
-  } else if (/chapter\s*13|bk13/i.test(text)) {
+  } else if (actualPublicRecordCount > 0 && /chapter\s*13|bk13/i.test(text)) {
     found.hasBankruptcy = true;
     found.bankruptcyChapter = "Chapter 13";
-  } else if (/bankruptcy/i.test(text)) {
+  } else if (actualPublicRecordCount > 0 && /bankruptcy/i.test(text)) {
     found.hasBankruptcy = true;
     found.bankruptcyChapter = "Bankruptcy";
   }
 
   return found;
+}
+
+function extractActualPublicRecordCount(text: string): number {
+  const summaryMatch = text.match(/\bPublic Records\s+(\d+)\s+(\d+)\s+(\d+)\b/i);
+  if (summaryMatch) {
+    return summaryMatch
+      .slice(1)
+      .reduce((total, value) => total + Number(value || 0), 0);
+  }
+
+  const publicRecordsSection = text.match(/10\.\s+Public Records([\s\S]*?)(?:11\.\s+Collections|12\.\s+|$)/i)?.[1] || "";
+  if (/currently have no bankruptcies/i.test(publicRecordsSection)) return 0;
+
+  const courtRecordMatches = publicRecordsSection.match(
+    /\b(?:chapter\s*(?:7|13)|bk(?:7|13)|u\.?s\.?\s*bankruptcy\s*court|court\s*record|tax\s*lien|civil\s*judgment|case\s*(?:number|#))/gi
+  ) || [];
+
+  return courtRecordMatches.length;
 }
 
 // --- Collection Block Extraction ---
@@ -387,6 +404,14 @@ function hasPositiveMoneyValue(values: string): boolean {
   return moneyMatches.some(value => Number(value.replace(/[$,]/g, '')) > 0);
 }
 
+function isPublicRecordIssueType(issueType: string): boolean {
+  return /bankruptcy public record|public record|judgment|tax lien/i.test(issueType);
+}
+
+function isPublicRecordAccountName(name: string): boolean {
+  return /\b(?:u\.?s\.?\s*)?bankruptcy\s+court\b|\bcourt\b|\bpublic\s+record\b|\bjudg(?:e)?ment\b|\btax\s+lien\b|\bcivil\s+judgment\b|\bcase\s*(?:number|#)\b/i.test(name);
+}
+
 function inferNegativeIssueType(blockText: string): string | null {
   const chargeOffLine = blockText
     .split('\n')
@@ -396,11 +421,21 @@ function inferNegativeIssueType(blockText: string): string | null {
     return 'Charge-off';
   }
 
-  const statusLine = blockText
-    .split('\n')
-    .find(line => /^(?:account\s+status|status)\b/i.test(line));
+  if (
+    /\b(?:charged\s+off|charge[\s-]?off\s+account|account\s+charged\s+to\s+profit\s+and\s+loss|unpaid\s+balance\s+reported\s+as\s+a\s+loss)\b/i.test(blockText)
+  ) {
+    return 'Charge-off';
+  }
 
-  if (statusLine && /collection/i.test(statusLine)) {
+  const statusLines = blockText
+    .split('\n')
+    .filter(line => /^(?:account\s+status|status)\b/i.test(line));
+
+  if (statusLines.some(line => /charge[\s-]?off|charged\s+off/i.test(line))) {
+    return 'Charge-off';
+  }
+
+  if (statusLines.some(line => /collection/i.test(line))) {
     return 'Collection';
   }
 
@@ -410,10 +445,6 @@ function inferNegativeIssueType(blockText: string): string | null {
 
   if (/(?:30|60|90|120)\s+days\s+past\s+due/i.test(blockText) && !/\b0\s+0\s+0\b/.test(blockText)) {
     return 'Late Payment';
-  }
-
-  if (/included in bankruptcy/i.test(blockText)) {
-    return 'Bankruptcy Public Record';
   }
 
   return null;
@@ -592,6 +623,10 @@ function computeAccountConfidence(account: any): number {
     return 0;
   }
 
+  if (isPublicRecordIssueType(issueType) && hasAccountNumber && !isPublicRecordAccountName(name)) {
+    return 0;
+  }
+
   if (name.length >= 2 && /[A-Za-z]/.test(name)) {
     if (!BUREAU_HEADERS.test(name) && !GENERIC_LABELS.test(name) && !isPlaceholderAccountName(name)) {
       confidence += 40;
@@ -716,12 +751,8 @@ function mergeTrustedNegativeAccounts(
       ) {
         existing.accountNumberMasked = blockAccountNumber;
       }
-      if (!existing.issueType || !VALID_ISSUE_TYPES.test(existing.issueType) || trustedAccount.issueType === 'Collection') {
-        existing.issueType = trustedAccount.issueType;
-      }
-      if (!existing.priority || trustedAccount.priority === 'High') {
-        existing.priority = trustedAccount.priority;
-      }
+      existing.issueType = trustedAccount.issueType;
+      existing.priority = trustedAccount.priority;
       continue;
     }
 
@@ -1072,10 +1103,16 @@ ${extractedText.substring(0, 20000)}
 ${preExtractedSection}
 NEGATIVE ACCOUNT DETECTION RULES:
 Detect ALL negative accounts using these criteria:
-1. Status fields: "charge off", "collection", "included in bankruptcy", "derogatory", "late payment", "public record"
+1. Status fields: "charge off", "collection", "derogatory", "late payment", "public record"
 2. Account sections: "Collection", "Public Records", "Derogatory Accounts", "Negative Accounts"
 3. PUBLIC RECORDS: Bankruptcy (Chapter 7, Chapter 13), tax liens, judgments MUST always be listed as negative accounts with issueType "Bankruptcy Public Record" or "Public Record"
-4. Any account marked "derogatory" or "included in bankruptcy" is negative even if balance is $0
+4. Any account marked "derogatory" is negative even if balance is $0
+
+IMPORTANT BANKRUPTCY DISTINCTION:
+- "Included in Bankruptcy 0 0 0" inside a payment summary is NOT a bankruptcy and must not create a Bankruptcy Public Record issue.
+- Only use "Bankruptcy Public Record" for actual court/public-record entries from the Public Records/Bankruptcies section.
+- Creditor tradelines with company names like Capital One, Comenity, Fingerhut, Fortiva, JPMCB, etc. must be labeled by their tradeline status, not as bankruptcy public records.
+- If a tradeline has Charge Off Amount greater than $0, "charged off", "charge off account", or "unpaid balance reported as a loss", use issueType "Charge-off".
 
 CRITICAL: Each negativeAccount entry MUST be a REAL tradeline/account with a real company name.
 DO NOT include any of these as account entries:
