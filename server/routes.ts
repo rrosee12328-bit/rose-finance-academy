@@ -175,6 +175,54 @@ function hasUsableAccountNumber(accountNumber: string): boolean {
   );
 }
 
+function isGenericClientName(name: string): boolean {
+  return /^(?:report|credit\s*report|client|customer|consumer|unknown|n\/a|na)$/i.test(name.trim());
+}
+
+function isDateLikeLine(line: string): boolean {
+  return /^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\s+\d{1,2},\s+\d{4}$/i.test(line.trim());
+}
+
+function normalizePersonName(rawName: string): string {
+  return rawName
+    .replace(/\s*\|.*$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isLikelyPersonName(rawName: string): boolean {
+  const name = normalizePersonName(rawName);
+  if (!name || name.length > 80) return false;
+  if (isDateLikeLine(name)) return false;
+  if (/^(?:powered by|three bureau credit report|credit report|report summary|equifax|experian|transunion)$/i.test(name)) return false;
+  if (/\d/.test(name)) return false;
+
+  const words = name.split(/\s+/);
+  return words.length >= 2 && words.length <= 5 && words.every(word => !/[\d|]/.test(word));
+}
+
+function extractClientNameFromReport(text: string): string {
+  const lines = text
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+    .slice(0, 40);
+
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^three bureau credit report$/i.test(lines[i])) continue;
+
+    for (let j = i + 1; j < Math.min(lines.length, i + 5); j++) {
+      if (isLikelyPersonName(lines[j])) return normalizePersonName(lines[j]);
+    }
+  }
+
+  for (const line of lines) {
+    if (isLikelyPersonName(line)) return normalizePersonName(line);
+  }
+
+  return '';
+}
+
 function chooseBestAccountNumber(raw: string): string {
   const candidates: string[] = [];
   const accountPattern = /(?:[#*Xx•-]+\s*)?\d{4,}/g;
@@ -404,6 +452,11 @@ function hasPositiveMoneyValue(values: string): boolean {
   return moneyMatches.some(value => Number(value.replace(/[$,]/g, '')) > 0);
 }
 
+function hasPositiveSummaryCount(line: string, labelPattern: RegExp): boolean {
+  const values = line.replace(labelPattern, '').trim();
+  return /\b[1-9]\d*\b/.test(values);
+}
+
 function isPublicRecordIssueType(issueType: string): boolean {
   return /bankruptcy public record|public record|judgment|tax lien/i.test(issueType);
 }
@@ -413,11 +466,17 @@ function isPublicRecordAccountName(name: string): boolean {
 }
 
 function inferNegativeIssueType(blockText: string): string | null {
+  const lines = blockText.split('\n');
   const chargeOffLine = blockText
     .split('\n')
     .find(line => /^charge\s*off\s+amount\b/i.test(line));
 
   if (chargeOffLine && hasPositiveMoneyValue(chargeOffLine)) {
+    return 'Charge-off';
+  }
+
+  const chargeOffSummaryLine = lines.find(line => /^charge\s*off\b/i.test(line));
+  if (chargeOffSummaryLine && hasPositiveSummaryCount(chargeOffSummaryLine, /^charge\s*off\b/i)) {
     return 'Charge-off';
   }
 
@@ -427,9 +486,7 @@ function inferNegativeIssueType(blockText: string): string | null {
     return 'Charge-off';
   }
 
-  const statusLines = blockText
-    .split('\n')
-    .filter(line => /^(?:account\s+status|status)\b/i.test(line));
+  const statusLines = lines.filter(line => /^(?:account\s+status|status)\b/i.test(line));
 
   if (statusLines.some(line => /charge[\s-]?off|charged\s+off/i.test(line))) {
     return 'Charge-off';
@@ -439,11 +496,17 @@ function inferNegativeIssueType(blockText: string): string | null {
     return 'Collection';
   }
 
+  const collectionSummaryLine = lines.find(line => /^collection\s+account\b/i.test(line));
+  if (collectionSummaryLine && hasPositiveSummaryCount(collectionSummaryLine, /^collection\s+account\b/i)) {
+    return 'Collection';
+  }
+
   if (/collection account/i.test(blockText) && /-\s*collection account/i.test(blockText)) {
     return 'Collection';
   }
 
-  if (/(?:30|60|90|120)\s+days\s+past\s+due/i.test(blockText) && !/\b0\s+0\s+0\b/.test(blockText)) {
+  const latePaymentLine = lines.find(line => /^(?:30|60|90|120)\s+days\s+past\s+due\b/i.test(line));
+  if (latePaymentLine && hasPositiveSummaryCount(latePaymentLine, /^(?:30|60|90|120)\s+days\s+past\s+due\b/i)) {
     return 'Late Payment';
   }
 
@@ -561,6 +624,42 @@ function extractCollectionSectionAccounts(text: string): NegativeAccountCandidat
   }
 
   return deduped;
+}
+
+function extractPublicRecordAccounts(text: string): NegativeAccountCandidate[] {
+  if (extractActualPublicRecordCount(text) === 0) return [];
+
+  const publicRecordsSection = text.match(/10\.\s+Public Records([\s\S]*?)(?:11\.\s+Collections|12\.\s+|$)/i)?.[1] || "";
+  if (!publicRecordsSection || /currently have no bankruptcies/i.test(publicRecordsSection)) return [];
+
+  const isBankruptcy = /\b(?:bankruptcy|chapter\s*(?:7|13)|bk(?:7|13))\b/i.test(publicRecordsSection);
+  const isJudgment = /\bjudg(?:e)?ment\b/i.test(publicRecordsSection);
+  const isTaxLien = /\btax\s+lien\b/i.test(publicRecordsSection);
+
+  let accountName = "Public Record";
+  if (isBankruptcy) accountName = "U.S. Bankruptcy Court";
+  else if (isJudgment) accountName = "Civil Judgment";
+  else if (isTaxLien) accountName = "Tax Lien";
+
+  const courtLine = publicRecordsSection
+    .split('\n')
+    .map(line => line.trim())
+    .find(line =>
+      /\bcourt\b/i.test(line) &&
+      !/bankruptcies are a legal status|public records stay/i.test(line) &&
+      line.length <= 80
+    );
+
+  if (courtLine) {
+    accountName = sanitizeCompanyCandidate(courtLine);
+  }
+
+  return [{
+    accountName,
+    accountNumberMasked: extractAccountNumberFromText(publicRecordsSection) || 'N/A',
+    issueType: isBankruptcy ? 'Bankruptcy Public Record' : 'Public Record',
+    priority: 'High',
+  }];
 }
 
 // --- Post-AI Negative Account Validation ---
@@ -707,11 +806,13 @@ function mergeTrustedNegativeAccounts(
   accounts: any[],
   blocks: CollectionBlock[],
   tradelineAccounts: NegativeAccountCandidate[] = [],
-  collectionSectionAccounts: NegativeAccountCandidate[] = []
+  collectionSectionAccounts: NegativeAccountCandidate[] = [],
+  publicRecordAccounts: NegativeAccountCandidate[] = []
 ): any[] {
   const merged = Array.isArray(accounts) ? accounts.map(normalizeNegativeAccount) : [];
   const trustedBlocks = getTrustedCollectionBlocks(blocks);
   const trustedAccounts: NegativeAccountCandidate[] = [
+    ...publicRecordAccounts,
     ...collectionSectionAccounts,
     ...tradelineAccounts,
     ...trustedBlocks.map(block => ({
@@ -726,7 +827,8 @@ function mergeTrustedNegativeAccounts(
     const blockName = sanitizeCompanyCandidate(trustedAccount.accountName);
     const blockNameKey = normalizeNameKey(blockName);
     const blockAccountNumber = maskAccountNumber(trustedAccount.accountNumberMasked);
-    if (!hasUsableAccountNumber(blockAccountNumber)) continue;
+    const isPublicRecordAccount = isPublicRecordIssueType(trustedAccount.issueType);
+    if (!hasUsableAccountNumber(blockAccountNumber) && !isPublicRecordAccount) continue;
 
     const existing = merged.find(account => {
       const existingNameKey = normalizeNameKey(account.accountName || '');
@@ -787,6 +889,20 @@ function mergeTrustedNegativeAccounts(
   return deduped;
 }
 
+function buildVerifiedNegativeAccounts(extractedText: string): any[] {
+  const tradelineAccounts = extractNegativeTradelineAccounts(extractedText);
+  const collectionSectionAccounts = extractCollectionSectionAccounts(extractedText);
+  const publicRecordAccounts = extractPublicRecordAccounts(extractedText);
+
+  return mergeTrustedNegativeAccounts(
+    [],
+    [],
+    tradelineAccounts,
+    collectionSectionAccounts,
+    publicRecordAccounts
+  );
+}
+
 function updateNegativeAccountCounts(plan: any): void {
   const negativeAccounts = Array.isArray(plan.negativeAccounts) ? plan.negativeAccounts : [];
 
@@ -803,19 +919,12 @@ function updateNegativeAccountCounts(plan: any): void {
 function cleanGeneratedPlan(plan: any, extractedText?: string): any {
   if (!plan || typeof plan !== 'object') return plan;
 
-  const tradelineAccounts = extractedText ? extractNegativeTradelineAccounts(extractedText) : [];
-  const collectionSectionAccounts = extractedText ? extractCollectionSectionAccounts(extractedText) : [];
   const cleanedPlan = {
     ...plan,
-    negativeAccounts: filterNegativeAccounts(Array.isArray(plan.negativeAccounts) ? plan.negativeAccounts : []),
+    negativeAccounts: extractedText
+      ? buildVerifiedNegativeAccounts(extractedText)
+      : filterNegativeAccounts(Array.isArray(plan.negativeAccounts) ? plan.negativeAccounts : []),
   };
-
-  cleanedPlan.negativeAccounts = mergeTrustedNegativeAccounts(
-    cleanedPlan.negativeAccounts,
-    [],
-    tradelineAccounts,
-    collectionSectionAccounts
-  );
   updateNegativeAccountCounts(cleanedPlan);
   return cleanedPlan;
 }
@@ -1035,10 +1144,10 @@ export async function registerRoutes(
       }
 
       // Parse the form fields
-      const { clientName, reportDate, coachNotes, consentConfirmed } = req.body;
+      const { clientName: submittedClientName, reportDate, coachNotes, consentConfirmed } = req.body;
       const isConsentConfirmed = consentConfirmed === 'true' || consentConfirmed === true;
       
-      if (!clientName || !reportDate || !isConsentConfirmed) {
+      if (!submittedClientName || !reportDate || !isConsentConfirmed) {
         return res.status(400).json({ message: "Missing required fields or consent" });
       }
 
@@ -1064,11 +1173,26 @@ export async function registerRoutes(
       const extractedText = parseResult.text;
       console.log(`[Upload] Successfully extracted ${extractedText.length} chars`);
 
-      // 2. Pre-extract collection blocks with real company names
-      const collectionBlocks = extractCollectionBlocks(extractedText);
-      const trustedCollectionBlocks = getTrustedCollectionBlocks(collectionBlocks);
+      const extractedClientName = extractClientNameFromReport(extractedText);
+      const submittedClientNameText = String(submittedClientName).trim();
+      const clientName = extractedClientName || submittedClientNameText;
+      if (extractedClientName && extractedClientName !== submittedClientNameText) {
+        console.log(`[Upload] Using report client name "${extractedClientName}" instead of submitted name "${submittedClientNameText}"`);
+      } else if (isGenericClientName(submittedClientNameText)) {
+        console.log(`[Upload] Submitted client name appears generic: "${submittedClientNameText}"`);
+      }
+
+      // 2. Pre-extract verified negative account rows from the full report.
       const negativeTradelineAccounts = extractNegativeTradelineAccounts(extractedText);
       const collectionSectionAccounts = extractCollectionSectionAccounts(extractedText);
+      const publicRecordAccounts = extractPublicRecordAccounts(extractedText);
+      const verifiedNegativeAccounts = mergeTrustedNegativeAccounts(
+        [],
+        [],
+        negativeTradelineAccounts,
+        collectionSectionAccounts,
+        publicRecordAccounts
+      );
 
       // 3. Fetch current expert settings
       const settings = await storage.getSettings();
@@ -1077,12 +1201,12 @@ export async function registerRoutes(
       console.log("[AI] Sending text to OpenAI for analysis...");
 
       let preExtractedSection = '';
-      if (trustedCollectionBlocks.length > 0) {
+      if (verifiedNegativeAccounts.length > 0) {
         preExtractedSection = `
-PRE-EXTRACTED COLLECTION ACCOUNTS (use these exact names):
-${trustedCollectionBlocks.map((b, i) => `  ${i + 1}. Company: "${sanitizeCompanyCandidate(b.companyName)}" | Account#: "${maskAccountNumber(b.accountNumber) || 'N/A'}" | Issue: Collection`).join('\n')}
+VERIFIED NEGATIVE ACCOUNTS FROM THE FULL REPORT (use this exact account table):
+${verifiedNegativeAccounts.map((account, i) => `  ${i + 1}. Company: "${account.accountName}" | Account#: "${account.accountNumberMasked || 'N/A'}" | Issue: ${account.issueType}`).join('\n')}
 
-IMPORTANT: Use the exact company names listed above for collection accounts in the negativeAccounts array. Do NOT rename them to "Unknown Collection" or any placeholder.
+IMPORTANT: The negativeAccounts array must match this verified table exactly. Do not add accounts that are not listed here.
 `;
       }
 
@@ -1098,7 +1222,7 @@ Dispute Philosophy: ${settings.disputePhilosophy}
 Dispute Order: ${settings.disputeOrder}
 Credit Building: ${settings.creditBuildingRecommendations}
 
-Credit Report Text (First 20k chars):
+Credit Report Text (First 20k chars for strategy context only):
 ${extractedText.substring(0, 20000)}
 ${preExtractedSection}
 NEGATIVE ACCOUNT DETECTION RULES:
@@ -1185,21 +1309,14 @@ Generate a structured JSON response matching this schema:
       const generatedPlanStr = aiResponse.choices[0]?.message?.content || "{}";
       const generatedPlan = JSON.parse(generatedPlanStr);
 
-      // 5. Post-processing: filter junk rows, then restore trusted extracted account rows.
+      // 5. Post-processing: use the verified full-report extraction as the account table.
       const rawNegativeAccounts = Array.isArray(generatedPlan.negativeAccounts)
         ? generatedPlan.negativeAccounts
         : [];
       const before = rawNegativeAccounts.length;
-      generatedPlan.negativeAccounts = filterNegativeAccounts(rawNegativeAccounts);
-      const filtered = generatedPlan.negativeAccounts.length;
-      generatedPlan.negativeAccounts = mergeTrustedNegativeAccounts(
-        generatedPlan.negativeAccounts,
-        trustedCollectionBlocks,
-        negativeTradelineAccounts,
-        collectionSectionAccounts
-      );
+      generatedPlan.negativeAccounts = verifiedNegativeAccounts;
       const after = generatedPlan.negativeAccounts.length;
-      console.log(`[Filter] Negative accounts: ${before} raw → ${filtered} validated → ${after} after extracted-account repair`);
+      console.log(`[Filter] Negative accounts: ${before} AI raw -> ${after} verified from full report`);
 
       updateNegativeAccountCounts(generatedPlan);
 
