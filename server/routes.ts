@@ -151,27 +151,42 @@ function sanitizeCompanyCandidate(candidate: string): string {
 
 function maskAccountNumber(raw: string): string {
   const cleaned = raw.replace(/\s+/g, '').replace(/^[#:]+|[#:]+$/g, '');
-  const digits = cleaned.replace(/\D/g, '');
+  const visible = cleaned.replace(/^[xX*#•-]+/, '');
+  const valueToMask = visible || cleaned;
+  const digits = valueToMask.replace(/\D/g, '');
 
   if (digits.length >= 4) {
     return `****${digits.slice(-4)}`;
   }
 
-  const alnum = cleaned.replace(/[^A-Za-z0-9]/g, '');
+  const alnum = valueToMask.replace(/[^A-Za-z0-9]/g, '');
   if (alnum.length >= 4) {
     return `****${alnum.slice(-4)}`;
   }
 
-  return cleaned;
+  if (alnum.length >= 2 && /[xX*#•-]/.test(cleaned)) {
+    return `****${alnum}`;
+  }
+
+  return valueToMask;
 }
 
 function hasUsableAccountNumber(accountNumber: string): boolean {
+  const raw = accountNumber.trim();
+  if (!raw || /^n\/?a$/i.test(raw) || isDateLikeLine(raw) || /^\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4}$/.test(raw)) {
+    return false;
+  }
+
   const normalized = maskAccountNumber(accountNumber);
+  const visible = normalized.replace(/^[*#•xX-]+/, '').replace(/[^A-Za-z0-9]/g, '');
+
   return Boolean(
     normalized &&
     normalized !== 'N/A' &&
-    /[\d*#•]/.test(normalized) &&
-    normalized.replace(/\D/g, '').length >= 4
+    !/^n\/?a$/i.test(normalized) &&
+    visible.length >= 2 &&
+    /[A-Za-z0-9]/.test(visible) &&
+    (visible.replace(/\D/g, '').length >= 2 || /[A-Za-z]/.test(visible))
   );
 }
 
@@ -225,7 +240,7 @@ function extractClientNameFromReport(text: string): string {
 
 function chooseBestAccountNumber(raw: string): string {
   const candidates: string[] = [];
-  const accountPattern = /(?:[#*Xx•-]+\s*)?\d{4,}/g;
+  const accountPattern = /(?:[#*Xx•-]+\s*)+[A-Za-z0-9]{2,}|(?:[#*Xx•-]+\s*)?\d{4,}/g;
   let match: RegExpExecArray | null;
 
   while ((match = accountPattern.exec(raw)) !== null) {
