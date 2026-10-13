@@ -482,6 +482,13 @@ function isPublicRecordAccountName(name: string): boolean {
 
 function inferNegativeIssueType(blockText: string): string | null {
   const lines = blockText.split('\n');
+
+  if (
+    /\b(?:factoring\s*company\s*account|factoringcompanyaccount|collection\s*agency|collectionagency)\b/i.test(blockText)
+  ) {
+    return 'Collection';
+  }
+
   const chargeOffLine = blockText
     .split('\n')
     .find(line => /^charge\s*off\s+amount\b/i.test(line));
@@ -501,7 +508,7 @@ function inferNegativeIssueType(blockText: string): string | null {
     return 'Charge-off';
   }
 
-  const statusLines = lines.filter(line => /^(?:account\s+status|status)\b/i.test(line));
+  const statusLines = lines.filter(line => /^(?:account\s+status|payment\s+status|pay\s+status|status)\b/i.test(line));
 
   if (statusLines.some(line => /charge[\s-]?off|charged\s+off/i.test(line))) {
     return 'Charge-off';
@@ -516,13 +523,23 @@ function inferNegativeIssueType(blockText: string): string | null {
     return 'Collection';
   }
 
-  if (/collection account/i.test(blockText) && /-\s*collection account/i.test(blockText)) {
+  if (
+    /\b(?:collection\s+account|placed\s+for\s+collection|in\s+collection)\b/i.test(blockText) ||
+    (/\boriginal\s+creditor\b/i.test(blockText) && /\b(?:retail|bank|credit|collection|delinquen|factoring)/i.test(blockText))
+  ) {
     return 'Collection';
   }
 
   const latePaymentLine = lines.find(line => /^(?:30|60|90|120)\s+days\s+past\s+due\b/i.test(line));
   if (latePaymentLine && hasPositiveSummaryCount(latePaymentLine, /^(?:30|60|90|120)\s+days\s+past\s+due\b/i)) {
     return 'Late Payment';
+  }
+
+  if (/\b(?:last\s+reported\s+delinquencies|past\s+due\s+amount)\b/i.test(blockText)) {
+    const pastDueLine = lines.find(line => /^past\s+due\s+amount\b/i.test(line));
+    if (pastDueLine && hasPositiveMoneyValue(pastDueLine)) {
+      return 'Late Payment';
+    }
   }
 
   return null;
@@ -533,7 +550,7 @@ function extractNegativeTradelineAccounts(text: string): NegativeAccountCandidat
   const accounts: NegativeAccountCandidate[] = [];
 
   for (let i = 0; i < lines.length; i++) {
-    const headerMatch = lines[i].match(/^([245]\.\d+)\s+(.+?)(?:\s+\d+)?$/);
+    const headerMatch = lines[i].match(/^(\d+\.\d+)\s+(.+?)(?:\s+\d+)?$/);
     if (!headerMatch) continue;
 
     const accountName = cleanSectionAccountName(headerMatch[2]);
@@ -541,7 +558,7 @@ function extractNegativeTradelineAccounts(text: string): NegativeAccountCandidat
 
     const blockLines: string[] = [];
     for (let j = i + 1; j < lines.length; j++) {
-      if (/^[245]\.\d+\s+/.test(lines[j]) || /^(?:7|8|9|10|11|12)\.\s+/.test(lines[j])) break;
+      if (/^\d+\.\d+\s+/.test(lines[j]) || /^(?:7|8|9|10|11|12)\.\s+/.test(lines[j])) break;
       blockLines.push(lines[j]);
     }
 
@@ -577,6 +594,9 @@ function extractNegativeTradelineAccounts(text: string): NegativeAccountCandidat
     if (existing.issueType !== 'Charge-off' && account.issueType === 'Charge-off') {
       existing.issueType = account.issueType;
       existing.priority = account.priority;
+    } else if (existing.issueType === 'Late Payment' && account.issueType === 'Collection') {
+      existing.issueType = account.issueType;
+      existing.priority = account.priority;
     }
   }
 
@@ -597,7 +617,7 @@ function extractCollectionSectionAccounts(text: string): NegativeAccountCandidat
 
   for (let i = collectionStart + 1; i < lines.length; i++) {
     if (/^12\.\s+/.test(lines[i])) break;
-    const agencyMatch = lines[i].match(/^Agency Client:\s*(.+)$/i);
+    const agencyMatch = lines[i].match(/^(?:Agency Client|Agency|Collector|Creditor):\s*(.+)$/i);
     if (!agencyMatch) continue;
 
     const accountName = normalizeCollectionAgencyName(agencyMatch[1]);
@@ -605,7 +625,7 @@ function extractCollectionSectionAccounts(text: string): NegativeAccountCandidat
 
     const blockLines: string[] = [];
     for (let j = i + 1; j < lines.length; j++) {
-      if (/^Agency Client:/i.test(lines[j]) || /^Date Reported:/i.test(lines[j]) || /^12\.\s+/.test(lines[j])) break;
+      if (/^(?:Agency Client|Agency|Collector|Creditor):/i.test(lines[j]) || /^Date Reported:/i.test(lines[j]) || /^12\.\s+/.test(lines[j])) break;
       blockLines.push(lines[j]);
     }
 
