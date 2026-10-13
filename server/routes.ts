@@ -7,6 +7,7 @@ import multer from "multer";
 import { openai } from "./replit_integrations/audio/client";
 import { PDFParse } from "pdf-parse";
 import PDFDocument from "pdfkit";
+import { applyVerifiedEvidenceToPlan, applyVerifiedEvidenceToReport, buildCreditReportEvidence } from "./credit-report-evidence";
 
 // Setup multer for file uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -953,6 +954,7 @@ function updateNegativeAccountCounts(plan: any): void {
 
 function cleanGeneratedPlan(plan: any, extractedText?: string): any {
   if (!plan || typeof plan !== 'object') return plan;
+  if (extractedText) return applyVerifiedEvidenceToPlan(plan, extractedText);
 
   const cleanedPlan = {
     ...plan,
@@ -966,6 +968,7 @@ function cleanGeneratedPlan(plan: any, extractedText?: string): any {
 
 function cleanReportForResponse(report: any): any {
   if (!report?.generatedPlan) return report;
+  if (report.extractedText) return applyVerifiedEvidenceToReport(report);
 
   return {
     ...report,
@@ -1208,7 +1211,7 @@ export async function registerRoutes(
       const extractedText = parseResult.text;
       console.log(`[Upload] Successfully extracted ${extractedText.length} chars`);
 
-      const extractedClientName = extractClientNameFromReport(extractedText);
+      const extractedClientName = buildCreditReportEvidence(extractedText).clientName;
       const submittedClientNameText = String(submittedClientName).trim();
       const clientName = extractedClientName || submittedClientNameText;
       if (extractedClientName && extractedClientName !== submittedClientNameText) {
@@ -1218,16 +1221,7 @@ export async function registerRoutes(
       }
 
       // 2. Pre-extract verified negative account rows from the full report.
-      const negativeTradelineAccounts = extractNegativeTradelineAccounts(extractedText);
-      const collectionSectionAccounts = extractCollectionSectionAccounts(extractedText);
-      const publicRecordAccounts = extractPublicRecordAccounts(extractedText);
-      const verifiedNegativeAccounts = mergeTrustedNegativeAccounts(
-        [],
-        [],
-        negativeTradelineAccounts,
-        collectionSectionAccounts,
-        publicRecordAccounts
-      );
+      const verifiedNegativeAccounts = buildCreditReportEvidence(extractedText).negativeAccounts;
 
       // 3. Fetch current expert settings
       const settings = await storage.getSettings();
@@ -1342,7 +1336,7 @@ Generate a structured JSON response matching this schema:
       });
 
       const generatedPlanStr = aiResponse.choices[0]?.message?.content || "{}";
-      const generatedPlan = JSON.parse(generatedPlanStr);
+      let generatedPlan = JSON.parse(generatedPlanStr);
 
       // 5. Post-processing: use the verified full-report extraction as the account table.
       const rawNegativeAccounts = Array.isArray(generatedPlan.negativeAccounts)
@@ -1353,7 +1347,7 @@ Generate a structured JSON response matching this schema:
       const after = generatedPlan.negativeAccounts.length;
       console.log(`[Filter] Negative accounts: ${before} AI raw -> ${after} verified from full report`);
 
-      updateNegativeAccountCounts(generatedPlan);
+      generatedPlan = applyVerifiedEvidenceToPlan(generatedPlan, extractedText);
 
       // 6. Save to Database
       const report = await storage.createReport({
